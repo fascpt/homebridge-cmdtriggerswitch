@@ -28,17 +28,17 @@ function CmdTriggerSwitch(log, config) {
   //
   this.setupConfig(config);
 
-  // Setup Services
-  //
-  this.createSwitchService();
-  this.createAccessoryInformationService();
-
   // Persistent Storage
   //
   this.cacheDirectory = HomebridgeAPI.user.persistPath();
   this.storageReady = storage.init({dir: this.cacheDirectory, forgiveParseErrors: true})
     .then(() => this._restoreState())
     .catch(err => this.log.error('Storage init error: ' + err));
+
+  // Setup Services
+  //
+  this.createSwitchService();
+  this.createAccessoryInformationService();
 }
 
 CmdTriggerSwitch.prototype.setupConfig = function(config) {
