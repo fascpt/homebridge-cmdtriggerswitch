@@ -133,6 +133,9 @@ CmdTriggerSwitch.prototype._restoreState = async function() {
   if (this.stateful) {
     const cachedState = await storage.getItem(this.name);
     if ((cachedState === undefined) || (cachedState === false)) {
+      if (cachedState === false) {
+        this.restoredFromCacheState = true;
+      }
       this.switchService.updateCharacteristic(Characteristic.On, false);
     } else {
       this.restoredFromCacheState = true;
