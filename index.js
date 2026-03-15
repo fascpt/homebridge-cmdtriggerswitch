@@ -3,6 +3,7 @@
 var Service, Characteristic, HomebridgeAPI;
 var exec = require('child_process').exec;
 var inherits = require('util').inherits;
+var storage = require('node-persist');
 
 
 module.exports = function(homebridge) {
@@ -19,24 +20,25 @@ function keepIntInRange(num, min, max){
 
 function CmdTriggerSwitch(log, config) {
   this.log = log;
-  this.timeout = -1;		
+  this.timeout = -1;
   this.restoredFromCacheState = false;
   this.remainingDelay = 0;
-  
+
   // Setup Configuration
   //
   this.setupConfig(config);
-  
-  // Persistent Storage
-  //
-  this.cacheDirectory = HomebridgeAPI.user.persistPath();
-  this.storage = require('node-persist');
-  this.storage.initSync({dir:this.cacheDirectory, forgiveParseErrors: true});
-  
+
   // Setup Services
   //
   this.createSwitchService();
   this.createAccessoryInformationService();
+
+  // Persistent Storage
+  //
+  this.cacheDirectory = HomebridgeAPI.user.persistPath();
+  this.storageReady = storage.init({dir: this.cacheDirectory, forgiveParseErrors: true})
+    .then(() => this._restoreState())
+    .catch(err => this.log.error('Storage init error: ' + err));
 }
 
 CmdTriggerSwitch.prototype.setupConfig = function(config) {
@@ -84,7 +86,10 @@ CmdTriggerSwitch.prototype.createSwitchService = function() {
   this.switchService = new Service.Switch(this.name);
 
   this.switchService.getCharacteristic(Characteristic.On)
-    .on('set', this.switchSetOn.bind(this));
+    .onGet(() => {
+      return this.switchService.getCharacteristic(Characteristic.On).value;
+    })
+    .onSet(this.switchSetOn.bind(this));
 
   if (this.interactiveDelay && !this.stateful) {
     const label = `${this.interactiveDelayLabel} (${this.delayUnit})`;
@@ -108,40 +113,45 @@ CmdTriggerSwitch.prototype.createSwitchService = function() {
     this.switchService.addCharacteristic(Characteristic.Delay);
 
     this.switchService.getCharacteristic(Characteristic.Delay)
-      .on('set', this.switchSetDelay.bind(this));
+      .onSet(this.switchSetDelay.bind(this));
+  }
+}
 
-    const cachedInteractiveDelay = this.storage.getItemSync(`${this.name} - interactiveDelay`);
-    if(cachedInteractiveDelay === undefined) {
+CmdTriggerSwitch.prototype._restoreState = async function() {
+  if (this.interactiveDelay && !this.stateful) {
+    const cachedInteractiveDelay = await storage.getItem(`${this.name} - interactiveDelay`);
+    if (cachedInteractiveDelay === undefined) {
       const cid = keepIntInRange(this.delay, this.delayMin, this.delayMax);
-      this.switchService.setCharacteristic(Characteristic.Delay, cid);
+      this.switchService.updateCharacteristic(Characteristic.Delay, cid);
     } else {
       const cid = keepIntInRange(cachedInteractiveDelay, this.delayMin, this.delayMax);
-      this.switchService.setCharacteristic(Characteristic.Delay, cid);
+      this.switchService.updateCharacteristic(Characteristic.Delay, cid);
       this.delay = cid;
     }
   }
 
   if (this.stateful) {
-    const cachedState = this.storage.getItemSync(this.name);
-    if((cachedState === undefined) || (cachedState === false)) {
-      if (cachedState === false) {
-        this.restoredFromCacheState = true;
-      }
-      this.switchService.setCharacteristic(Characteristic.On, false);
+    const cachedState = await storage.getItem(this.name);
+    if ((cachedState === undefined) || (cachedState === false)) {
+      this.switchService.updateCharacteristic(Characteristic.On, false);
     } else {
       this.restoredFromCacheState = true;
-      this.switchService.setCharacteristic(Characteristic.On, true);
+      this.switchService.updateCharacteristic(Characteristic.On, true);
     }
   } else {
-    const cachedStartTime = this.storage.getItemSync(`${this.name} - startTime`);
+    const cachedStartTime = await storage.getItem(`${this.name} - startTime`);
     if (cachedStartTime !== undefined) {
       const diffTime = Date.now() - cachedStartTime;
       this.log('diffTime: ' + diffTime/1000 + 's');
       if (diffTime > 0 && diffTime < this.delay*this.delayFactor) {
         this.remainingDelay = this.delay*this.delayFactor - diffTime;
-        this.switchService.setCharacteristic(Characteristic.On, true);
-      }  
-    } 
+        this.switchService.updateCharacteristic(Characteristic.On, true);
+        this.log(`Restored switch state to ON after restart, remaining delay ${this.remainingDelay}ms`);
+        this.timeout = setTimeout(function() {
+          this.switchService.setCharacteristic(Characteristic.On, false);
+        }.bind(this), this.remainingDelay);
+      }
+    }
   }
 }
 
@@ -156,18 +166,25 @@ CmdTriggerSwitch.prototype.getServices = function() {
   return [this.accessoryInformationService,  this.switchService];
 }
 
-CmdTriggerSwitch.prototype.switchSetOn = function(on, callback) {
+CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
 
   this.log("Setting switch to " + on);
 
+  try {
+    await this.storageReady;
+  } catch {
+    this.log.error("Cannot set state: storage unavailable");
+    return;
+  }
+
   if (this.stateful) {
-	  this.storage.setItemSync(this.name, on);
+	  await storage.setItem(this.name, on);
   } else {
     if (on) {
       let delayMs = this.remainingDelay;
       if (delayMs <= 0) {
         delayMs = this.delay*this.delayFactor;
-        this.storage.setItemSync(`${this.name} - startTime`, Date.now());
+        await storage.setItem(`${this.name} - startTime`, Date.now());
       }
       this.log("Delay in ms: " + delayMs);
       this.timeout = setTimeout(function() {
@@ -199,13 +216,16 @@ CmdTriggerSwitch.prototype.switchSetOn = function(on, callback) {
       }
     }
   }
-
-  callback();
 }
 
-CmdTriggerSwitch.prototype.switchSetDelay = function(delay, callback) {
+CmdTriggerSwitch.prototype.switchSetDelay = async function(delay) {
   // this.log(`${this.interactiveDelayLabel}: ${delay}${this.delayUnit}`);
   this.delay = delay;
-  this.storage.setItemSync(`${this.name} - interactiveDelay`, delay);
-  callback();
+  try {
+    await this.storageReady;
+  } catch {
+    this.log.error("Cannot save delay: storage unavailable");
+    return;
+  }
+  await storage.setItem(`${this.name} - interactiveDelay`, delay);
 }
