@@ -17,6 +17,12 @@
     "node": "^18.15.0 || ^20.7.0 || ^22 || ^24",
     "homebridge": "^1.6.0 || ^2.0.0"
   },
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
   "dependencies": {
     "node-persist": "^4.0.0"
   }

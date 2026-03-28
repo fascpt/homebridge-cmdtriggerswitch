@@ -21,7 +21,6 @@ function keepIntInRange(num, min, max){
 function CmdTriggerSwitch(log, config) {
   this.log = log;
   this.timeout = -1;
-  this.restoredFromCacheState = false;
   this.remainingDelay = 0;
 
   // Setup Configuration
@@ -104,7 +103,6 @@ CmdTriggerSwitch.prototype.createSwitchService = function() {
         minStep: step,
         perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY]
       };
-      // var label = theLabel;
       Characteristic.call(this, label, '8728b5cc-5c49-4b44-bb25-a4c4d4715779', props);
       this.value = this.getDefaultValue();
     };
@@ -132,15 +130,7 @@ CmdTriggerSwitch.prototype._restoreState = async function() {
 
   if (this.stateful) {
     const cachedState = await storage.getItem(this.name);
-    if ((cachedState === undefined) || (cachedState === false)) {
-      if (cachedState === false) {
-        this.restoredFromCacheState = true;
-      }
-      this.switchService.updateCharacteristic(Characteristic.On, false);
-    } else {
-      this.restoredFromCacheState = true;
-      this.switchService.updateCharacteristic(Characteristic.On, true);
-    }
+    this.switchService.updateCharacteristic(Characteristic.On, cachedState === true);
   } else {
     const cachedStartTime = await storage.getItem(`${this.name} - startTime`);
     if (cachedStartTime !== undefined) {
@@ -181,7 +171,7 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
   }
 
   if (this.stateful) {
-	  await storage.setItem(this.name, on);
+    await storage.setItem(this.name, on);
   } else {
     if (on) {
       let delayMs = this.remainingDelay;
@@ -200,11 +190,8 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
     }
   }
 
-  if (this.restoredFromCacheState) {
-    this.log(`Restored switch state to ${on} after restart.`);
-    this.restoredFromCacheState = false;
-  } else if (this.remainingDelay > 0) {
-    this.log(`Restored switch state to ${on} after restart, remaining delay ${this.remainingDelay}ms`);
+  if (this.remainingDelay > 0) {
+    this.log(`Consuming remaining delay from restart (${this.remainingDelay}ms), skipping command for state ${on}`);
     this.remainingDelay = 0;
   } else {
     if (on) {
@@ -222,7 +209,6 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
 }
 
 CmdTriggerSwitch.prototype.switchSetDelay = async function(delay) {
-  // this.log(`${this.interactiveDelayLabel}: ${delay}${this.delayUnit}`);
   this.delay = delay;
   try {
     await this.storageReady;
