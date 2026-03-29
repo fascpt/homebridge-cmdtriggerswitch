@@ -380,6 +380,58 @@ describe('Service Creation', () => {
     await sw.storageReady;
     expect(MockService.Switch).toHaveBeenCalledWith('MyGarageSwitch');
   });
+
+  test('onGet handler is registered for On characteristic', () => {
+    // Homebridge v2 requires onGet for every readable characteristic;
+    // absence silently falls back to cached .value but logs a warning.
+    const { service } = makeSwitch();
+    expect(service._chars[MockCharacteristic.On].onGet).toHaveBeenCalledTimes(1);
+  });
+
+  test('onGet for On returns the current characteristic value', () => {
+    // The getter must reflect live .value so HomeKit reads are always
+    // fresh rather than returning a stale snapshot.
+    const { service } = makeSwitch();
+    const handler = service._chars[MockCharacteristic.On].onGet.mock.calls[0][0];
+    service._chars[MockCharacteristic.On].value = true;
+    expect(handler()).toBe(true);
+    service._chars[MockCharacteristic.On].value = false;
+    expect(handler()).toBe(false);
+  });
+
+  test('onGet and onSet handlers are registered for Delay characteristic', async () => {
+    // Both handlers must be present: onGet so HomeKit can read the slider
+    // position, onSet so user adjustments are persisted.
+    const { sw, service } = makeSwitch({
+      interactiveDelaySettings: {
+        interactiveDelay: true,
+        delayMin: 100,
+        delayMax: 1000,
+        delayStep: 100,
+      },
+    });
+    await sw.storageReady;
+    expect(service._chars[MockCharacteristic.Delay].onGet).toHaveBeenCalledTimes(1);
+    expect(service._chars[MockCharacteristic.Delay].onSet).toHaveBeenCalledTimes(1);
+  });
+
+  test('onGet for Delay returns the current characteristic value', async () => {
+    // Same rationale as On: the getter must reflect the current slider value.
+    const { sw, service } = makeSwitch({
+      interactiveDelaySettings: {
+        interactiveDelay: true,
+        delayMin: 100,
+        delayMax: 1000,
+        delayStep: 100,
+      },
+    });
+    await sw.storageReady;
+    const delayChar = service._chars[MockCharacteristic.Delay];
+    const handler = delayChar.onGet.mock.calls[0][0];
+    delayChar.value = 500;
+    expect(handler()).toBe(500);
+  });
+
 });
 
 // ============================================================================
@@ -501,22 +553,6 @@ describe('switchSetOn - temporary switch', () => {
     expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
   });
 
-  test('turning ON with remainingDelay > 0 uses remainingDelay and does not reset startTime', async () => {
-    // When a mid-delay restart is detected, the switch resumes with the
-    // remaining time rather than restarting the full delay.
-    const { sw, service } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
-    await sw.storageReady;
-    sw.remainingDelay = 2000;
-    mockStorage.setItem.mockClear();
-    await sw.switchSetOn(true);
-    // Should NOT overwrite startTime because remainingDelay was already set
-    expect(mockStorage.setItem).not.toHaveBeenCalledWith('TestSwitch - startTime', expect.any(Number));
-    // Timer fires at 2000ms, not 5000ms
-    jest.advanceTimersByTime(1999);
-    expect(service.setCharacteristic).not.toHaveBeenCalled();
-    jest.advanceTimersByTime(1);
-    expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
-  });
 });
 
 // ============================================================================
@@ -619,25 +655,22 @@ describe('_restoreState - stateful switch', () => {
 // ============================================================================
 
 describe('_restoreState - temporary switch', () => {
-  test('no cached startTime -> no state restored, remainingDelay stays 0', async () => {
+  test('no cached startTime -> no state restored', async () => {
     // If Homebridge stopped while the switch was already OFF, nothing should
     // be restored on restart.
     mockStorage.getItem.mockResolvedValue(undefined);
     const { sw, service } = makeSwitch({ delay: 5000 });
     await sw.storageReady;
-    expect(sw.remainingDelay).toBe(0);
     expect(service.updateCharacteristic).not.toHaveBeenCalledWith(MockCharacteristic.On, true);
   });
 
-  test('cached startTime with remaining delay -> restores ON, sets remainingDelay, schedules timeout', async () => {
+  test('cached startTime with remaining delay -> restores ON and schedules timeout', async () => {
     // When Homebridge restarts mid-delay, the switch must resume as ON with a
     // timeout for the remaining time, not the full delay.
     const elapsed = 2000;
     mockStorage.getItem.mockResolvedValue(Date.now() - elapsed); // 2s of 5s elapsed
     const { sw, service } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
     await sw.storageReady;
-    expect(sw.remainingDelay).toBeGreaterThan(0);
-    expect(sw.remainingDelay).toBeLessThan(5000);
     expect(service.updateCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, true);
     jest.runAllTimers();
     expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
@@ -649,26 +682,49 @@ describe('_restoreState - temporary switch', () => {
     mockStorage.getItem.mockResolvedValue(Date.now() - 10000); // 10s elapsed of 5s delay
     const { sw, service } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
     await sw.storageReady;
-    expect(sw.remainingDelay).toBe(0);
     expect(service.updateCharacteristic).not.toHaveBeenCalledWith(MockCharacteristic.On, true);
     jest.runAllTimers();
     expect(service.setCharacteristic).not.toHaveBeenCalled();
   });
 
-  test('after restart with remaining delay, switchSetOn skips command and does not reset startTime', async () => {
-    // The remainingDelay path in switchSetOn: skip commands, clear remainingDelay.
-    // Prevents onCmd from firing again when the switch is resumed from a
-    // mid-delay restart.
+  test('cached startTime at exact delay boundary -> no restore', async () => {
+    // The restore condition is diffTime < delay (strict less-than). If the
+    // full delay has elapsed exactly, the switch expired cleanly and must
+    // come up as OFF with no pending timer.
+    const delay = 5000;
+    mockStorage.getItem.mockResolvedValue(Date.now() - delay); // diffTime === delay
+    const { sw, service } = makeSwitch({ delay, delayUnit: 'ms' });
+    await sw.storageReady;
+    expect(service.updateCharacteristic).not.toHaveBeenCalledWith(MockCharacteristic.On, true);
+    jest.runAllTimers();
+    expect(service.setCharacteristic).not.toHaveBeenCalled();
+  });
+
+  test('restore timeout fires at remaining time, not full delay', async () => {
+    // Verifies the remaining-time calculation: with 2s elapsed of a 5s delay,
+    // the timeout must fire at exactly 3000ms, not 5000ms.
+    const elapsed = 2000;
+    mockStorage.getItem.mockResolvedValue(Date.now() - elapsed);
+    const { sw, service } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
+    await sw.storageReady;
+    jest.advanceTimersByTime(2999); // 1ms before the 3s mark
+    expect(service.setCharacteristic).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
+  });
+
+  test('after mid-delay restart, onSet(false) from timer expiry executes offCmd', async () => {
+    // Regression test: after a restart with remaining delay, when the auto-off
+    // timer fires and Homebridge propagates setCharacteristic to onSet(false),
+    // offCmd must NOT be suppressed.
     const elapsed = 2000;
     mockStorage.getItem.mockResolvedValue(Date.now() - elapsed);
     const { sw } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
     await sw.storageReady;
-    mockStorage.setItem.mockClear();
     mockExec.mockClear();
-    await sw.switchSetOn(true); // simulate onSet being triggered by restored state
-    expect(mockStorage.setItem).not.toHaveBeenCalledWith('TestSwitch - startTime', expect.any(Number));
-    expect(mockExec).not.toHaveBeenCalled();
-    expect(sw.remainingDelay).toBe(0); // cleared after being consumed
+    // Simulate Homebridge calling onSet(false) when the restore timeout fires
+    await sw.switchSetOn(false);
+    expect(mockExec).toHaveBeenCalledWith('echo OFF');
   });
 });
 
@@ -754,6 +810,37 @@ describe('_restoreState - interactive delay', () => {
     await sw.storageReady;
     expect(service.updateCharacteristic).toHaveBeenCalledWith(MockCharacteristic.Delay, 1000);
   });
+
+  test('mid-delay restart uses cached interactive delay, not config default, for remaining timeout', async () => {
+    // Config delay=5000ms, but the user had set the slider to 8000ms.
+    // Homebridge restarts 6000ms in. If the code incorrectly used the config
+    // default (5000ms), diffTime(6000) >= delay(5000) → no restore at all.
+    // Using the cached value (8000ms) gives 2000ms remaining: the switch
+    // must come up as ON and the timeout must fire at exactly 2000ms.
+    const cachedDelay = 8000;
+    const elapsed = 6000;
+    mockStorage.getItem.mockImplementation((key) => {
+      if (key === 'TestSwitch - interactiveDelay') return Promise.resolve(cachedDelay);
+      if (key === 'TestSwitch - startTime') return Promise.resolve(Date.now() - elapsed);
+      return Promise.resolve(undefined);
+    });
+    const { sw, service } = makeSwitch({
+      delay: 5000,
+      interactiveDelaySettings: {
+        interactiveDelay: true,
+        delayMin: 1000,
+        delayMax: 10000,
+        delayStep: 1000,
+      },
+    });
+    await sw.storageReady;
+    expect(sw.delay).toBe(cachedDelay);
+    expect(service.updateCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, true);
+    jest.advanceTimersByTime(1999);
+    expect(service.setCharacteristic).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
+  });
 });
 
 // ============================================================================
@@ -795,13 +882,12 @@ describe('switchSetDelay', () => {
     expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
   });
 
-  test('logs error and skips setItem when storageReady fails', async () => {
-    // Force storageReady to a rejected promise so the catch path in
-    // switchSetDelay fires; the delay change must not be persisted.
+  test('logs error and skips setItem when storage init fails', async () => {
+    // When storage.init() rejects, storageAvailable stays false and
+    // switchSetDelay must log an error and not persist the delay change.
     mockStorage.init.mockRejectedValue(new Error('disk full'));
     const { sw } = makeSwitch(idConfig);
-    try { await sw.storageReady; } catch { /* handled by constructor .catch */ }
-    sw.storageReady = Promise.reject(new Error('unavailable'));
+    await sw.storageReady;
     await sw.switchSetDelay(400);
     expect(mockLog.error).toHaveBeenCalledWith(expect.stringContaining('storage unavailable'));
     expect(mockStorage.setItem).not.toHaveBeenCalledWith('TestSwitch - interactiveDelay', expect.anything());
@@ -813,26 +899,68 @@ describe('switchSetDelay', () => {
 // ============================================================================
 
 describe('storage unavailable - switchSetOn', () => {
-  test('logs error and does not execute command when storageReady rejects', async () => {
-    // Override storageReady to simulate a storage failure seen by switchSetOn;
-    // the plugin must log the error and bail out without running any command.
+  test('logs error and does not execute command when storage init fails', async () => {
+    // When storage.init() rejects, storageAvailable stays false and
+    // switchSetOn must log an error and bail out without running any command.
+    mockStorage.init.mockRejectedValue(new Error('storage gone'));
     const { sw } = makeSwitch({ stateful: true });
     await sw.storageReady;
-    sw.storageReady = Promise.reject(new Error('storage gone'));
-    mockExec.mockClear();
     await sw.switchSetOn(true);
     expect(mockLog.error).toHaveBeenCalledWith(expect.stringContaining('storage unavailable'));
     expect(mockExec).not.toHaveBeenCalled();
   });
 
-  test('does not save state to storage when storageReady rejects', async () => {
+  test('does not save state to storage when storage init fails', async () => {
     // Confirms that the early return on storage failure also prevents a
     // partial setItem write.
+    mockStorage.init.mockRejectedValue(new Error('storage gone'));
     const { sw } = makeSwitch({ stateful: true });
     await sw.storageReady;
-    sw.storageReady = Promise.reject(new Error('storage gone'));
-    mockStorage.setItem.mockClear();
     await sw.switchSetOn(true);
     expect(mockStorage.setItem).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// 10. storageAvailable flag
+// ============================================================================
+
+describe('storageAvailable flag', () => {
+  test('storageAvailable is false immediately after construction', () => {
+    // The flag starts false and is only set true after the async init chain
+    // completes. Code that runs synchronously after construction (like an
+    // immediate switchSetOn call) must observe the false state.
+    const { sw } = makeSwitch();
+    expect(sw.storageAvailable).toBe(false);
+  });
+
+  test('storageAvailable is true after successful init', async () => {
+    // Verifies the flag is correctly set by the .then() that follows
+    // _restoreState(); guards against accidentally removing that assignment.
+    const { sw } = makeSwitch();
+    await sw.storageReady;
+    expect(sw.storageAvailable).toBe(true);
+  });
+
+  test('storageAvailable stays false when storage.init() rejects', async () => {
+    // If the storage backend is unavailable at startup, the flag must remain
+    // false so every subsequent handler call is blocked.
+    mockStorage.init.mockRejectedValue(new Error('disk full'));
+    const { sw } = makeSwitch();
+    await sw.storageReady;
+    expect(sw.storageAvailable).toBe(false);
+  });
+
+  test('storageAvailable stays false when _restoreState throws, and commands are blocked', async () => {
+    // init() succeeds but getItem() throws during restore. The error is caught
+    // by the constructor .catch(), storageAvailable stays false, and subsequent
+    // calls to switchSetOn must be blocked rather than partially executing.
+    mockStorage.getItem.mockRejectedValue(new Error('read error'));
+    const { sw } = makeSwitch({ stateful: true });
+    await sw.storageReady;
+    expect(sw.storageAvailable).toBe(false);
+    await sw.switchSetOn(true);
+    expect(mockExec).not.toHaveBeenCalled();
+    expect(mockLog.error).toHaveBeenCalledWith(expect.stringContaining('storage unavailable'));
   });
 });

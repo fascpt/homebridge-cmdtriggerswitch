@@ -21,7 +21,7 @@ function keepIntInRange(num, min, max){
 function CmdTriggerSwitch(log, config) {
   this.log = log;
   this.timeout = -1;
-  this.remainingDelay = 0;
+  this.storageAvailable = false;
 
   // Setup Configuration
   //
@@ -32,6 +32,7 @@ function CmdTriggerSwitch(log, config) {
   this.cacheDirectory = HomebridgeAPI.user.persistPath();
   this.storageReady = storage.init({dir: this.cacheDirectory, forgiveParseErrors: true})
     .then(() => this._restoreState())
+    .then(() => { this.storageAvailable = true; })
     .catch(err => this.log.error('Storage init error: ' + err));
 
   // Setup Services
@@ -111,6 +112,9 @@ CmdTriggerSwitch.prototype.createSwitchService = function() {
     this.switchService.addCharacteristic(Characteristic.Delay);
 
     this.switchService.getCharacteristic(Characteristic.Delay)
+      .onGet(() => {
+        return this.switchService.getCharacteristic(Characteristic.Delay).value;
+      })
       .onSet(this.switchSetDelay.bind(this));
   }
 }
@@ -137,12 +141,12 @@ CmdTriggerSwitch.prototype._restoreState = async function() {
       const diffTime = Date.now() - cachedStartTime;
       this.log('diffTime: ' + diffTime/1000 + 's');
       if (diffTime > 0 && diffTime < this.delay*this.delayFactor) {
-        this.remainingDelay = this.delay*this.delayFactor - diffTime;
+        const remaining = this.delay*this.delayFactor - diffTime;
         this.switchService.updateCharacteristic(Characteristic.On, true);
-        this.log(`Restored switch state to ON after restart, remaining delay ${this.remainingDelay}ms`);
+        this.log(`Restored switch state to ON after restart, remaining delay ${remaining}ms`);
         this.timeout = setTimeout(function() {
           this.switchService.setCharacteristic(Characteristic.On, false);
-        }.bind(this), this.remainingDelay);
+        }.bind(this), remaining);
       }
     }
   }
@@ -163,9 +167,8 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
 
   this.log("Setting switch to " + on);
 
-  try {
-    await this.storageReady;
-  } catch {
+  await this.storageReady;
+  if (!this.storageAvailable) {
     this.log.error("Cannot set state: storage unavailable");
     return;
   }
@@ -174,11 +177,8 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
     await storage.setItem(this.name, on);
   } else {
     if (on) {
-      let delayMs = this.remainingDelay;
-      if (delayMs <= 0) {
-        delayMs = this.delay*this.delayFactor;
-        await storage.setItem(`${this.name} - startTime`, Date.now());
-      }
+      const delayMs = this.delay*this.delayFactor;
+      await storage.setItem(`${this.name} - startTime`, Date.now());
       this.log("Delay in ms: " + delayMs);
       this.timeout = setTimeout(function() {
         this.switchService.setCharacteristic(Characteristic.On, false);
@@ -190,29 +190,23 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
     }
   }
 
-  if (this.remainingDelay > 0) {
-    this.log(`Consuming remaining delay from restart (${this.remainingDelay}ms), skipping command for state ${on}`);
-    this.remainingDelay = 0;
+  if (on) {
+    if (this.onCmd !== undefined) {
+      this.log("Executing ON command: '" + this.onCmd + "'");
+      exec(this.onCmd);
+    }
   } else {
-    if (on) {
-      if (this.onCmd !== undefined) {
-        this.log("Executing ON command: '" + this.onCmd + "'");
-        exec(this.onCmd);
-      }
-    } else {
-      if (this.offCmd !== undefined) {
-        this.log("Executing OFF command: '" + this.offCmd + "'");
-        exec(this.offCmd);
-      }
+    if (this.offCmd !== undefined) {
+      this.log("Executing OFF command: '" + this.offCmd + "'");
+      exec(this.offCmd);
     }
   }
 }
 
 CmdTriggerSwitch.prototype.switchSetDelay = async function(delay) {
   this.delay = delay;
-  try {
-    await this.storageReady;
-  } catch {
+  await this.storageReady;
+  if (!this.storageAvailable) {
     this.log.error("Cannot save delay: storage unavailable");
     return;
   }
