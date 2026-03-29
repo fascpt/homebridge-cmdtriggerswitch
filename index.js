@@ -15,6 +15,7 @@ module.exports = function(homebridge) {
 
 function keepIntInRange(num, min, max){
   const parsed = parseInt(num);
+  if (isNaN(parsed)) return min;
   return Math.min(Math.max(parsed, min), max);
 }
 
@@ -119,6 +120,18 @@ CmdTriggerSwitch.prototype.createSwitchService = function() {
   }
 }
 
+CmdTriggerSwitch.prototype._scheduleAutoOff = function(delayMs) {
+  clearTimeout(this.timeout);
+  this.timeout = setTimeout(() => {
+    this.switchService.setCharacteristic(Characteristic.On, false);
+  }, delayMs);
+}
+
+CmdTriggerSwitch.prototype._cancelAutoOff = function() {
+  clearTimeout(this.timeout);
+  this.timeout = -1;
+}
+
 CmdTriggerSwitch.prototype._restoreState = async function() {
   if (this.interactiveDelay && !this.stateful) {
     const cachedInteractiveDelay = await storage.getItem(`${this.name} - interactiveDelay`);
@@ -144,9 +157,7 @@ CmdTriggerSwitch.prototype._restoreState = async function() {
         const remaining = this.delay*this.delayFactor - diffTime;
         this.switchService.updateCharacteristic(Characteristic.On, true);
         this.log(`Restored switch state to ON after restart, remaining delay ${remaining}ms`);
-        this.timeout = setTimeout(function() {
-          this.switchService.setCharacteristic(Characteristic.On, false);
-        }.bind(this), remaining);
+        this._scheduleAutoOff(remaining);
       }
     }
   }
@@ -180,13 +191,10 @@ CmdTriggerSwitch.prototype.switchSetOn = async function(on) {
       const delayMs = this.delay*this.delayFactor;
       await storage.setItem(`${this.name} - startTime`, Date.now());
       this.log("Delay in ms: " + delayMs);
-      this.timeout = setTimeout(function() {
-        this.switchService.setCharacteristic(Characteristic.On, false);
-      }.bind(this), delayMs);
+      this._scheduleAutoOff(delayMs);
     } else {
-      if (this.timeout !== -1) {
-        clearTimeout(this.timeout);
-      }
+      this._cancelAutoOff();
+      await storage.removeItem(`${this.name} - startTime`);
     }
   }
 

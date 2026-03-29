@@ -8,6 +8,7 @@ const mockStorage = {
   init: jest.fn(),
   getItem: jest.fn(),
   setItem: jest.fn(),
+  removeItem: jest.fn(),
 };
 jest.mock('node-persist', () => mockStorage);
 
@@ -118,6 +119,7 @@ beforeEach(() => {
   mockStorage.init.mockResolvedValue(undefined);
   mockStorage.getItem.mockResolvedValue(undefined);
   mockStorage.setItem.mockResolvedValue(undefined);
+  mockStorage.removeItem.mockResolvedValue(undefined);
   mockHomebridge.user.persistPath.mockReturnValue('/tmp/test-persist');
 });
 
@@ -553,6 +555,31 @@ describe('switchSetOn - temporary switch', () => {
     expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
   });
 
+  test('manual OFF before timer expires removes startTime from storage', async () => {
+    // Ensures a manual OFF clears the persisted startTime so that a Homebridge
+    // restart after the manual OFF does not incorrectly restore the switch to ON.
+    const { sw } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
+    await sw.storageReady;
+    await sw.switchSetOn(true);
+    mockStorage.removeItem.mockClear();
+    await sw.switchSetOn(false);
+    expect(mockStorage.removeItem).toHaveBeenCalledWith('TestSwitch - startTime');
+  });
+
+  test('second ON before first timer fires cancels the first timeout', async () => {
+    // Guards against a leaked timeout when onSet(true) is called twice in
+    // rapid succession. Only one auto-off timer should be active at a time.
+    const { sw, service } = makeSwitch({ delay: 5000, delayUnit: 'ms' });
+    await sw.storageReady;
+    await sw.switchSetOn(true);
+    await sw.switchSetOn(true); // second ON while first timer is still pending
+    // Advance past one full delay: only one setCharacteristic call should occur,
+    // not two (which would happen if the first timer were leaked).
+    jest.runAllTimers();
+    expect(service.setCharacteristic).toHaveBeenCalledTimes(1);
+    expect(service.setCharacteristic).toHaveBeenCalledWith(MockCharacteristic.On, false);
+  });
+
 });
 
 // ============================================================================
@@ -891,6 +918,18 @@ describe('switchSetDelay', () => {
     await sw.switchSetDelay(400);
     expect(mockLog.error).toHaveBeenCalledWith(expect.stringContaining('storage unavailable'));
     expect(mockStorage.setItem).not.toHaveBeenCalledWith('TestSwitch - interactiveDelay', expect.anything());
+  });
+
+  test('this.delay is updated synchronously before storage write completes', async () => {
+    // switchSetDelay sets this.delay as its first statement, before awaiting
+    // storageReady. The in-memory delay is therefore immediately available for
+    // any switchSetOn call that follows, even if the persist write is still
+    // pending.
+    const { sw } = makeSwitch(idConfig);
+    const delayPromise = sw.switchSetDelay(400); // do NOT await yet
+    expect(sw.delay).toBe(400);                  // updated before any await
+    await delayPromise;
+    expect(mockStorage.setItem).toHaveBeenCalledWith('TestSwitch - interactiveDelay', 400);
   });
 });
 
